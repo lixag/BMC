@@ -110,11 +110,14 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
             auto *SDC = DST->getSingleDecl();
             if (auto *VDC = dyn_cast<VarDecl>(SDC)) {
                 std::string Var = VDC->getQualifiedNameAsString();
-                formula.append(Var + std::to_string(SSATable[Var]));
                 auto *Init = VDC->getInit();
-                if (Init)
+                if (Init) {
+                    formula.append(Var + std::to_string(SSATable[Var]));
                     if (auto *IntLit = dyn_cast<IntegerLiteral>(Init))
                         formula.append(IntLit->getValue().toString(10, false));
+                } else {
+                    SSATable[Var];
+                }
             }
         }
         }
@@ -126,7 +129,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
             return true;
         FullSourceLoc full_location = Ctx->getFullLoc(Decl->getBeginLoc());
         std::vector<Formula> Fs;
-        DenseMap<StringRef, int> SSATable;
+        std::vector<DenseMap<StringRef, int>> SSATables;
         if (full_location.isValid()) {
             if (Decl->hasBody()) {
                 auto *FuncBody = Decl->getBody();
@@ -143,6 +146,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                     // raw_fd_ostream OS1(std::to_string(cnt) + ".txt",
                     // EC1);
                     Formula F;
+                    DenseMap<StringRef, int> SSATable;
                     for (auto &N : P) {
                         for (auto &E : *N) {
                             auto *S = E.castAs<CFGStmt>().getStmt();
@@ -151,6 +155,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                         // auto T = N->getTerminator();
                     }
                     Fs.push_back(F);
+                    SSATables.push_back(SSATable);
                 }
             }
         }
@@ -162,11 +167,14 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
             errs() << '\n';
             ++cnt;
         }
-
-        errs() << "SSATable: ";
-        for (auto &Elem : SSATable)
-            errs() << Elem.first << ' ' << Elem.second << ' ';
-        errs() << '\n';
+        int num = 1;
+        for (auto &SSATable : SSATables) {
+            errs() << "SSATable" << num << ": ";
+            for (auto &Elem : SSATable)
+                errs() << Elem.first << ' ' << Elem.second << ' ';
+            errs() << '\n';
+            ++num;
+        }
 
         // transform Paths of length K to formulas
         // impl a parser
