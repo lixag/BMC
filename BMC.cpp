@@ -5,9 +5,7 @@
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
-#include <llvm/ADT/SmallSet.h>
-#include <unordered_set>
-#include <z3++.h>
+#include <vector>
 // using namespace z3;
 using namespace clang;
 using namespace clang::driver;
@@ -28,7 +26,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
     BlockPaths Paths;
     unsigned long Depth = 7;
 
-    void DfsHelper(BlockPaths &PS, BlockPath &P, CFGBlock *Src) {
+    void dfsHelper(BlockPaths &PS, BlockPath &P, CFGBlock *Src) {
         if (P.size() > Depth)
             return;
         if (!P.empty()) {
@@ -43,15 +41,15 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
         }
         P.push_back(Src);
         for (auto &E : Src->succs())
-            DfsHelper(PS, P, E.getReachableBlock());
+            dfsHelper(PS, P, E.getReachableBlock());
         P.pop_back();
     }
 
   public:
     FunctionDeclVisitor(ASTContext *ctx) : Ctx{ctx} {}
 
-    std::string processStmt(Formula &F, const Stmt *stmt,
-                            DenseMap<StringRef, int> &SSATable) {
+    void processStmt(Formula &F, const Stmt *stmt,
+                     DenseMap<StringRef, int> &SSATable) {
         std::string formula;
         switch (stmt->getStmtClass()) {
         case Stmt::BinaryOperatorClass: {
@@ -114,8 +112,9 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                 std::string Var = VDC->getQualifiedNameAsString();
                 formula.append(Var + std::to_string(SSATable[Var]));
                 auto *Init = VDC->getInit();
-                if (auto *IntLit = dyn_cast<IntegerLiteral>(Init))
-                    formula.append(IntLit->getValue().toString(10, false));
+                if (Init)
+                    if (auto *IntLit = dyn_cast<IntegerLiteral>(Init))
+                        formula.append(IntLit->getValue().toString(10, false));
             }
         }
         }
@@ -123,8 +122,10 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
     }
 
     bool VisitFunctionDecl(FunctionDecl *Decl) {
+        if (!Ctx->getSourceManager().isWrittenInMainFile(Decl->getBeginLoc()))
+            return true;
         FullSourceLoc full_location = Ctx->getFullLoc(Decl->getBeginLoc());
-        Formula F;
+        std::vector<Formula> Fs;
         DenseMap<StringRef, int> SSATable;
         if (full_location.isValid()) {
             if (Decl->hasBody()) {
@@ -135,29 +136,34 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                 // FuncCFG->viewCFG(LangOptions());
 
                 BlockPath Path;
-                DfsHelper(Paths, Path, &FuncCFG->getEntry());
-
+                dfsHelper(Paths, Path, &FuncCFG->getEntry());
+                errs() << "size: " << Paths.size() << "\n";
                 for (auto &P : Paths) {
                     // std::error_code EC1;
                     // raw_fd_ostream OS1(std::to_string(cnt) + ".txt",
                     // EC1);
+                    Formula F;
                     for (auto &N : P) {
                         for (auto &E : *N) {
                             auto *S = E.castAs<CFGStmt>().getStmt();
                             processStmt(F, S, SSATable);
                         }
                         // auto T = N->getTerminator();
-                        // auto *tt = T.getStmt();
                     }
-                    //++cnt;
+                    Fs.push_back(F);
                 }
             }
         }
+        int cnt = 1;
+        for (auto &F : Fs) {
+            errs() << "path" << cnt << ": ";
+            for (auto &Elem : F.Clauses)
+                errs() << Elem << ' ';
+            errs() << '\n';
+            ++cnt;
+        }
 
-        for (auto &Elem : F.Clauses)
-            errs() << Elem << ' ';
-        errs() << '\n';
-
+        errs() << "SSATable: ";
         for (auto &Elem : SSATable)
             errs() << Elem.first << ' ' << Elem.second << ' ';
         errs() << '\n';
@@ -216,7 +222,6 @@ class FunctionDeclConsumer : public clang::ASTConsumer {
 };
 
 class FunctionDeclAction : public clang::ASTFrontendAction {
-
   public:
     std::unique_ptr<clang::ASTConsumer>
     CreateASTConsumer(clang::CompilerInstance &Compiler,
