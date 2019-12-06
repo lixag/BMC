@@ -5,6 +5,7 @@
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
+#include <unordered_map>
 #include <vector>
 using namespace clang;
 using namespace clang::driver;
@@ -16,8 +17,8 @@ static cl::OptionCategory BMCCategory("BMC options");
 namespace {
 class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
     struct Formula {
-        SmallVector<std::string, 10> Clauses;
-        DenseMap<StringRef, int> SSATable;
+        std::vector<std::string> Clauses;
+        std::unordered_map<std::string, int> SSATable;
     };
     using BlockPaths = std::vector<std::vector<CFGBlock *>>;
     using BlockPath = std::vector<CFGBlock *>;
@@ -48,11 +49,12 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
   public:
     FunctionDeclVisitor(ASTContext *ctx) : Ctx{ctx} {}
 
-    void processStmt(SmallVector<std::string, 10> &Clause, const Stmt *stmt,
-                     DenseMap<StringRef, int> &SSATable) {
-        std::string formula;
+    void processStmt(std::vector<std::string> &Clause, const Stmt *stmt,
+                     std::unordered_map<std::string, int> &SSATable) {
+
         switch (stmt->getStmtClass()) {
         case Stmt::BinaryOperatorClass: {
+            std::string formula;
             auto *B = cast<BinaryOperator>(stmt);
             auto *LHS = B->getLHS();
             auto *RHS = B->getRHS();
@@ -89,7 +91,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                     if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
                         std::string Var = VD->getQualifiedNameAsString();
                         formula.append(Var + std::to_string(SSATable[Var]));
-                        formula.append(B->getOpcodeStr());
+                        formula.append(BOP->getOpcodeStr());
                     }
                 }
                 if (auto *IntLit1 = dyn_cast<IntegerLiteral>(RHS1)) {
@@ -103,25 +105,43 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                     }
                 }
             }
+            Clause.push_back(formula);
             break;
         }
         case Stmt::DeclStmtClass: {
             auto *DST = cast<DeclStmt>(stmt);
-            auto *SDC = DST->getSingleDecl();
-            if (auto *VDC = dyn_cast<VarDecl>(SDC)) {
-                std::string Var = VDC->getQualifiedNameAsString();
-                auto *Init = VDC->getInit();
-                if (Init) {
-                    formula.append(Var + std::to_string(SSATable[Var]));
-                    if (auto *IntLit = dyn_cast<IntegerLiteral>(Init))
-                        formula.append(IntLit->getValue().toString(10, false));
-                } else {
-                    SSATable[Var];
+            auto DS = DST->decls();
+            for (const auto D : DS) {
+                std::string formula;
+                if (auto *VDC = dyn_cast<VarDecl>(D)) {
+                    std::string Var = VDC->getQualifiedNameAsString();
+                    auto *Init = VDC->getInit();
+                    if (Init) {
+                        formula.append(Var + std::to_string(SSATable[Var]));
+                        if (auto *IntLit = dyn_cast<IntegerLiteral>(Init))
+                            formula.append(
+                                IntLit->getValue().toString(10, false));
+                    } else {
+                        SSATable[Var];
+                    }
                 }
+                auto Loc = Ctx->getFullLoc(stmt->getBeginLoc());
+                if (formula.empty())
+                    errs() << Loc.getSpellingLineNumber() << '\n';
+                else
+                    Clause.push_back(formula);
             }
+        } break;
+
+        case Stmt::UnaryOperatorClass: {
+            std::string formula;
+            auto Loc = Ctx->getFullLoc(stmt->getBeginLoc());
+            errs() << "Unary op: " << Loc.getSpellingLineNumber() << '\n';
+            Clause.push_back(formula);
+            if (formula.empty())
+                errs() << Loc.getSpellingLineNumber() << '\n';
         }
         }
-        Clause.push_back(formula);
     }
 
     bool VisitFunctionDecl(FunctionDecl *Decl) {
@@ -144,30 +164,36 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                     // std::error_code EC1;
                     // raw_fd_ostream OS1(std::to_string(cnt) + ".txt",
                     // EC1);
-                    SmallVector<std::string, 10> Clauses;
-                    DenseMap<StringRef, int> SSATable;
+                    std::vector<std::string> Clauses;
+                    std::unordered_map<std::string, int> SSATable;
                     for (auto &N : P) {
                         for (auto &E : *N) {
                             auto *S = E.castAs<CFGStmt>().getStmt();
+                            if (!(S->getStmtClass() ==
+                                  Stmt::BinaryOperatorClass) and
+                                !(S->getStmtClass() ==
+                                  Stmt::UnaryOperatorClass) and
+                                !(S->getStmtClass() == Stmt::DeclStmtClass))
+                                continue;
                             processStmt(Clauses, S, SSATable);
                         }
                         // auto T = N->getTerminator();
                     }
-                    Fs.emplace_back(Clauses, SSATable);
+                    Fs.push_back({Clauses, SSATable});
                 }
             }
         }
-        //        int cnt = 1;
-        //        for (auto &F : Fs) {
-        //            errs() << "path" << cnt << ": ";
-        //            for (auto &Elem : F.Clauses)
-        //                errs() << Elem << ' ';
-        //            errs() << "\nSSATable" << cnt << ": ";
-        //            for (auto &Elem : F.SSATable)
-        //                errs() << Elem.first << ' ' << Elem.second << ' ';
-        //            errs() << '\n';
-        //            ++cnt;
-        //        }
+        int cnt = 1;
+        for (auto &F : Fs) {
+            errs() << "path" << cnt << ": size " << F.Clauses.size() << ' ';
+            for (auto &Elem : F.Clauses)
+                errs() << Elem << ' ';
+            errs() << "\nSSATable" << cnt << ": ";
+            for (auto &Elem : F.SSATable)
+                errs() << Elem.first << ' ' << Elem.second << ' ';
+            errs() << '\n';
+            ++cnt;
+        }
 
         // transform Paths of length K to formulas
         // impl a parser
@@ -176,14 +202,16 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
         for (auto &F : Fs) {
             std::error_code EC;
             raw_fd_ostream OS("Z3_code" + std::to_string(fileNum) + ".txt", EC);
-            OS << "#include<z3++>\n#include<iostream>\nusing "
-                  "namespacez3;\ncontext "
-                  "c;\nsolver s(c);\n";
+            OS << "#include <z3++>\n"
+                  "#include <iostream>\n"
+                  "using namespace z3;\n"
+                  "context c;\n"
+                  "solver s(c);\n";
 
             for (auto &C : F.SSATable) {
-                for (int i = 0; i < C.second; ++i)
+                for (int i = 1; i <= C.second; ++i)
                     OS << "expr " << C.first << i << " = c.int_const(\""
-                       << C.first << i << "\"\n";
+                       << C.first << i << "\")\n";
             }
 
             int num = 1;
@@ -194,17 +222,18 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
             }
 
             OS << "s.check();\n";
-            OS << R"("switch (s.check()) {\n
-                             case unsat:
-                                std::cout << "this path is valid\n";
-                                break;
-                             case sat:
-                                std::cout <<"this path is not valid\n";
-                                break;
-                              case unknown:
-                                std::cout <<"unknown\n";
-                                break;
-                              })";
+            OS << R"(switch (s.check()) {
+                         case unsat:
+                             std::cout << "this path is valid";
+                             break;
+                         case sat:
+                             std::cout <<"this path is not valid";
+                             break;
+                         case unknown:
+                             std::cout <<"unknown";
+                             break;
+                     })";
+            OS << '\n';
             ++fileNum;
         }
 
