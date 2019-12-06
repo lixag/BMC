@@ -6,7 +6,6 @@
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
 #include <vector>
-// using namespace z3;
 using namespace clang;
 using namespace clang::driver;
 using namespace clang::tooling;
@@ -18,6 +17,7 @@ namespace {
 class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
     struct Formula {
         SmallVector<std::string, 10> Clauses;
+        DenseMap<StringRef, int> SSATable;
     };
     using BlockPaths = std::vector<std::vector<CFGBlock *>>;
     using BlockPath = std::vector<CFGBlock *>;
@@ -48,7 +48,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
   public:
     FunctionDeclVisitor(ASTContext *ctx) : Ctx{ctx} {}
 
-    void processStmt(Formula &F, const Stmt *stmt,
+    void processStmt(SmallVector<std::string, 10> &Clause, const Stmt *stmt,
                      DenseMap<StringRef, int> &SSATable) {
         std::string formula;
         switch (stmt->getStmtClass()) {
@@ -121,7 +121,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
             }
         }
         }
-        F.Clauses.push_back(formula);
+        Clause.push_back(formula);
     }
 
     bool VisitFunctionDecl(FunctionDecl *Decl) {
@@ -129,7 +129,6 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
             return true;
         FullSourceLoc full_location = Ctx->getFullLoc(Decl->getBeginLoc());
         std::vector<Formula> Fs;
-        std::vector<DenseMap<StringRef, int>> SSATables;
         if (full_location.isValid()) {
             if (Decl->hasBody()) {
                 auto *FuncBody = Decl->getBody();
@@ -145,72 +144,69 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                     // std::error_code EC1;
                     // raw_fd_ostream OS1(std::to_string(cnt) + ".txt",
                     // EC1);
-                    Formula F;
+                    SmallVector<std::string, 10> Clauses;
                     DenseMap<StringRef, int> SSATable;
                     for (auto &N : P) {
                         for (auto &E : *N) {
                             auto *S = E.castAs<CFGStmt>().getStmt();
-                            processStmt(F, S, SSATable);
+                            processStmt(Clauses, S, SSATable);
                         }
                         // auto T = N->getTerminator();
                     }
-                    Fs.push_back(F);
-                    SSATables.push_back(SSATable);
+                    Fs.emplace_back(Clauses, SSATable);
                 }
             }
         }
-        int cnt = 1;
-        for (auto &F : Fs) {
-            errs() << "path" << cnt << ": ";
-            for (auto &Elem : F.Clauses)
-                errs() << Elem << ' ';
-            errs() << '\n';
-            ++cnt;
-        }
-        int num = 1;
-        for (auto &SSATable : SSATables) {
-            errs() << "SSATable" << num << ": ";
-            for (auto &Elem : SSATable)
-                errs() << Elem.first << ' ' << Elem.second << ' ';
-            errs() << '\n';
-            ++num;
-        }
+        //        int cnt = 1;
+        //        for (auto &F : Fs) {
+        //            errs() << "path" << cnt << ": ";
+        //            for (auto &Elem : F.Clauses)
+        //                errs() << Elem << ' ';
+        //            errs() << "\nSSATable" << cnt << ": ";
+        //            for (auto &Elem : F.SSATable)
+        //                errs() << Elem.first << ' ' << Elem.second << ' ';
+        //            errs() << '\n';
+        //            ++cnt;
+        //        }
 
         // transform Paths of length K to formulas
         // impl a parser
 
-        //    int fileNum = 0;
-        //    for (auto &F : Formulas) {
-        //      std::error_code EC;
-        //      raw_fd_ostream OS("Z3_code" + std::to_string(fileNum) +
-        //      ".txt", EC); OS <<
-        //      "#include<z3++>\n#include<iostream>\nusing namespace
-        //      z3;\ncontext "
-        //            "c;\nsolver s(c);\n";
-        //
-        //      for (auto &C : F.Consts)
-        //        OS << "expr " << C << " = c.int_const(\"" << C << "\"\n";
-        //      int cnt = 1;
-        //      for (auto &Clause : F.Clauses) {
-        //        OS << "expr conjecture" << cnt << " = " << Clause <<
-        //        ";\n"; OS << "s.add(conjecture" << cnt << ");\n";
-        //        ++cnt;
-        //      }
-        //
-        //      OS << "s.check();\n";
-        //      OS << R"("switch (s.check()) {\n
-        //                     case unsat:
-        //                        std::cout << "this path is valid\n";
-        //                        break;
-        //                     case sat:
-        //                        std::cout <<"this path is not valid\n";
-        //                        break;
-        //                      case unknown:
-        //                        std::cout <<"unknown\n";
-        //                        break;
-        //                      })";
-        //      ++fileNum;
-        //    }
+        int fileNum = 0;
+        for (auto &F : Fs) {
+            std::error_code EC;
+            raw_fd_ostream OS("Z3_code" + std::to_string(fileNum) + ".txt", EC);
+            OS << "#include<z3++>\n#include<iostream>\nusing "
+                  "namespacez3;\ncontext "
+                  "c;\nsolver s(c);\n";
+
+            for (auto &C : F.SSATable) {
+                for (int i = 0; i < C.second; ++i)
+                    OS << "expr " << C.first << i << " = c.int_const(\""
+                       << C.first << i << "\"\n";
+            }
+
+            int num = 1;
+            for (auto &Clause : F.Clauses) {
+                OS << "expr conjecture" << num << " = " << Clause << ";\n";
+                OS << "s.add(conjecture" << num << ");\n";
+                ++num;
+            }
+
+            OS << "s.check();\n";
+            OS << R"("switch (s.check()) {\n
+                             case unsat:
+                                std::cout << "this path is valid\n";
+                                break;
+                             case sat:
+                                std::cout <<"this path is not valid\n";
+                                break;
+                              case unknown:
+                                std::cout <<"unknown\n";
+                                break;
+                              })";
+            ++fileNum;
+        }
 
         return true;
     }
