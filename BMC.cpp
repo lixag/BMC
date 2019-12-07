@@ -7,6 +7,7 @@
 #include "clang/Tooling/Tooling.h"
 #include <unordered_map>
 #include <vector>
+
 using namespace clang;
 using namespace clang::driver;
 using namespace clang::tooling;
@@ -16,10 +17,12 @@ static cl::OptionCategory BMCCategory("BMC options");
 
 namespace {
 class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
+private:
   struct Formula {
     std::vector<std::string> Clauses;
     std::unordered_map<std::string, int> SSATable;
   };
+
   using BlockPaths = std::vector<std::vector<CFGBlock *>>;
   using BlockPath = std::vector<CFGBlock *>;
 
@@ -49,6 +52,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
 public:
   FunctionDeclVisitor(ASTContext *ctx) : Ctx{ctx} {}
 
+  // generating ssa form formula here
   void processStmt(std::vector<std::string> &Clause, const Stmt *stmt,
                    std::unordered_map<std::string, int> &SSATable) {
     switch (stmt->getStmtClass()) {
@@ -124,9 +128,7 @@ public:
           }
         }
         auto Loc = Ctx->getFullLoc(stmt->getBeginLoc());
-        if (formula.empty())
-          errs() << Loc.getSpellingLineNumber() << '\n';
-        else
+        if (!formula.empty())
           Clause.push_back(formula);
       }
       break;
@@ -135,9 +137,10 @@ public:
       std::string formula;
       auto Loc = Ctx->getFullLoc(stmt->getBeginLoc());
       errs() << "Unary op: " << Loc.getSpellingLineNumber() << '\n';
-      Clause.push_back(formula);
       if (formula.empty())
         errs() << Loc.getSpellingLineNumber() << '\n';
+      else
+        Clause.push_back(formula);
     }
     }
   }
@@ -152,19 +155,18 @@ public:
         auto *FuncBody = Decl->getBody();
         std::unique_ptr<CFG> FuncCFG =
             CFG::buildCFG(Decl, FuncBody, Ctx, CFG::BuildOptions());
-        FuncCFG->dump(LangOptions(), false);
-        FuncCFG->viewCFG(LangOptions());
+        // FuncCFG->dump(LangOptions(), false);
+        // FuncCFG->viewCFG(LangOptions());
 
         BlockPath Path;
         dfsHelper(Paths, Path, &FuncCFG->getEntry());
         errs() << "size: " << Paths.size() << "\n";
         for (auto &P : Paths) {
-          // std::error_code EC1;
-          // raw_fd_ostream OS1(std::to_string(cnt) + ".txt",
-          // EC1);
           std::vector<std::string> Clauses;
           std::unordered_map<std::string, int> SSATable;
+          errs() << "path: ";
           for (auto &N : P) {
+            errs() << N->getBlockID() << ' ' << N << ' ';
             for (auto &E : *N) {
               auto *S = E.castAs<CFGStmt>().getStmt();
               if (!(S->getStmtClass() == Stmt::BinaryOperatorClass) and
@@ -173,18 +175,19 @@ public:
                 continue;
               processStmt(Clauses, S, SSATable);
             }
-
             if (N->succ_empty())
               continue;
-
             if (N == P.back())
               continue;
-            auto NextBlock = std::next(N);
+            CFGBlock *NextBlock = *std::next(&N);
+            // errs() << "NextBlock Addr: " << NextBlock << '\n';
             auto ID = NextBlock->getBlockID();
             // look at the terminator
             auto T = N->getTerminator();
             auto *St = T.getStmt();
-            if (auto *IfSt = dyn_cast<IfStmt>(St)) {
+            if (!St)
+              continue;
+            if (isa<IfStmt>(St)) {
               // rewrite the last the stmt in N
               if ((*N->succ_begin())->getBlockID() != ID)
                 Clauses.back() = "!(" + Clauses.back() + ")";
@@ -192,89 +195,95 @@ public:
               auto *LB = NextBlock->getLabel();
               if (LB == nullptr)
                 continue;
-              if (auto *L = dyn_cast<DefaultStmt>(LB)) {
-                const auto Last = Clauses.back();
-                Clauses.pop_back();
+              const auto Last = Clauses.back();
+              Clauses.pop_back();
+              if (isa<DefaultStmt>(LB)) {
                 for (auto *FirstCase = SwitchSt->getSwitchCaseList();
                      FirstCase->getNextSwitchCase() != nullptr;
                      FirstCase = FirstCase->getNextSwitchCase()) {
                   if (auto *CaseSt = dyn_cast<CaseStmt>(FirstCase)) {
-                    if (CaseSt->getLHS()) {
-                      if (auto *ConstSt =
-                              dyn_cast<ConstantExpr>(CaseSt->getLHS())) {
-                        auto Val =
-                            ConstSt->getResultAsAPSInt().toString(10, false);
-                        Clauses.push_back(Last + "!=" + Val);
+                    if (!CaseSt->getLHS())
+                      continue;
+                    if (auto *ConstSt =
+                            dyn_cast<ConstantExpr>(CaseSt->getLHS())) {
+                      auto *CaseVal = ConstSt->getSubExpr();
+                      if (auto *IntLit = dyn_cast<IntegerLiteral>(CaseVal)) {
+                        auto Val = IntLit->getValue().toString(10, false);
+                        Clauses.push_back('(' + Last + ")!=" + Val);
                       }
                     }
                   }
                 }
-              } else {
+              } else if (auto *CaseSt = dyn_cast<CaseStmt>(LB)) {
+                if (!CaseSt->getLHS())
+                  continue;
+                if (auto *ConstSt = dyn_cast<ConstantExpr>(CaseSt->getLHS())) {
+                  auto Val = ConstSt->getResultAsAPSInt().toString(10, false);
+                  Clauses.push_back('(' + Last + ")==" + Val);
+                }
               }
             }
           }
-        }
+          errs() << '\n';
 
-        Fs.push_back({Clauses, SSATable});
+          Fs.push_back({Clauses, SSATable});
+        }
       }
     }
-  }
-  int cnt = 1;
-  for (auto &F : Fs) {
-    errs() << "path" << cnt << ": size " << F.Clauses.size() << ' ';
-    for (auto &Elem : F.Clauses)
-      errs() << Elem << ' ';
-    errs() << "\nSSATable" << cnt << ": ";
-    for (auto &Elem : F.SSATable)
-      errs() << Elem.first << ' ' << Elem.second << ' ';
-    errs() << '\n';
-    ++cnt;
-  }
+    //    int cnt = 1;
+    //    for (auto &F : Fs) {
+    //      errs() << "path" << cnt << ": size " << F.Clauses.size() << ' ';
+    //      for (auto &Elem : F.Clauses)
+    //        errs() << Elem << ' ';
+    //      errs() << "\nSSATable" << cnt << ": ";
+    //      for (auto &Elem : F.SSATable)
+    //        errs() << Elem.first << ' ' << Elem.second << ' ';
+    //      errs() << '\n';
+    //      ++cnt;
+    //    }
 
-  // transform Paths of length K to formulas
-  // impl a parser
+    int fileNum = 0;
+    for (auto &F : Fs) {
+      std::error_code EC;
+      raw_fd_ostream OS("Z3_code" + std::to_string(fileNum) + ".cc", EC);
+      OS << "#include <z3++.h>\n"
+            "#include <iostream>\n"
+            "using namespace z3;\n"
+            "int main() {\n"
+            "  context c;\n"
+            "  solver s(c);\n";
 
-  int fileNum = 0;
-  for (auto &F : Fs) {
-    std::error_code EC;
-    raw_fd_ostream OS("Z3_code" + std::to_string(fileNum) + ".txt", EC);
-    OS << "#include <z3++>\n"
-          "#include <iostream>\n"
-          "using namespace z3;\n"
-          "context c;\n"
-          "solver s(c);\n";
+      for (auto &C : F.SSATable) {
+        for (int i = 1; i <= C.second; ++i)
+          OS << "  expr " << C.first << i << " = c.int_const(\"" << C.first << i
+             << "\");\n";
+      }
 
-    for (auto &C : F.SSATable) {
-      for (int i = 1; i <= C.second; ++i)
-        OS << "expr " << C.first << i << " = c.int_const(\"" << C.first << i
-           << "\")\n";
+      int num = 1;
+      for (auto &Clause : F.Clauses) {
+        OS << "  expr conjecture" << num << " = " << Clause << ";\n";
+        OS << "  s.add(conjecture" << num << ");\n";
+        ++num;
+      }
+
+      OS << "  s.check();\n";
+      OS << R"(  switch (s.check()) {
+                     case unsat:
+                         std::cout << "this path is valid";
+                         break;
+                     case sat:
+                         std::cout <<"this path is not valid";
+                         break;
+                     case unknown:
+                         std::cout <<"unknown";
+                         break;
+                 })";
+      OS << "\n}\n";
+      ++fileNum;
     }
 
-    int num = 1;
-    for (auto &Clause : F.Clauses) {
-      OS << "expr conjecture" << num << " = " << Clause << ";\n";
-      OS << "s.add(conjecture" << num << ");\n";
-      ++num;
-    }
-
-    OS << "s.check();\n";
-    OS << R"(switch (s.check()) {
-                         case unsat:
-                             std::cout << "this path is valid";
-                             break;
-                         case sat:
-                             std::cout <<"this path is not valid";
-                             break;
-                         case unknown:
-                             std::cout <<"unknown";
-                             break;
-                     })";
-    OS << '\n';
-    ++fileNum;
+    return true;
   }
-
-  return true;
-}
 }; // namespace
 
 class FunctionDeclConsumer : public clang::ASTConsumer {
