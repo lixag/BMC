@@ -8,10 +8,10 @@
 #include <unordered_map>
 #include <vector>
 
+using namespace llvm;
 using namespace clang;
 using namespace clang::driver;
 using namespace clang::tooling;
-using namespace llvm;
 
 static cl::OptionCategory BMCCategory("clang-bmc options");
 static cl::opt<int> MaxDepth("depth", cl::desc("<max_depth>"), cl::Optional,
@@ -83,16 +83,14 @@ void declStmt(const Stmt *stmt, std::vector<std::string> &Clause,
 void processStmt(const Stmt *stmt, std::vector<std::string> &Clause,
                  std::unordered_map<std::string, int> &SSATable) {
     switch (stmt->getStmtClass()) {
-    case Stmt::BinaryOperatorClass: {
+    case Stmt::BinaryOperatorClass:
         Clause.push_back(binaryOp(stmt, SSATable));
         break;
-    }
-    case Stmt::DeclStmtClass: {
+    case Stmt::DeclStmtClass:
         declStmt(stmt, Clause, SSATable);
         break;
-    }
-    case Stmt::UnaryOperatorClass: {
-    }
+    case Stmt::UnaryOperatorClass:
+        break;
     }
 }
 
@@ -153,7 +151,7 @@ void processBranches(CFGBlock *N, std::vector<std::string> &Clauses,
     if (N->succ_empty())
         return;
     auto *NextBlock = *std::next(&N);
-    auto ID = NextBlock->getBlockID();
+    const auto ID = NextBlock->getBlockID();
     auto T = N->getTerminator();
     auto *St = T.getStmt();
     if (!St)
@@ -252,7 +250,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
     }
 };
 
-class FunctionDeclConsumer : public clang::ASTConsumer {
+class FunctionDeclConsumer : public ASTConsumer {
     FunctionDeclVisitor Visitor;
 
   public:
@@ -265,12 +263,11 @@ class FunctionDeclConsumer : public clang::ASTConsumer {
     }
 };
 
-class FunctionDeclAction : public clang::ASTFrontendAction {
+class FunctionDeclAction : public ASTFrontendAction {
   public:
-    std::unique_ptr<clang::ASTConsumer>
-    CreateASTConsumer(clang::CompilerInstance &Compiler,
-                      llvm::StringRef InFile) override {
-        return std::unique_ptr<clang::ASTConsumer>(
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &Compiler,
+                                                   StringRef InFile) override {
+        return std::unique_ptr<ASTConsumer>(
             new FunctionDeclConsumer{&Compiler.getASTContext()});
     }
 };
@@ -282,3 +279,4 @@ int main(int argc, const char **argv) {
                    OptionsParser.getSourcePathList());
     return Tool.run(newFrontendActionFactory<FunctionDeclAction>().get());
 }
+
