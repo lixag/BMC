@@ -13,8 +13,9 @@ using namespace clang::driver;
 using namespace clang::tooling;
 using namespace llvm;
 
-static cl::OptionCategory BMCCategory("BMC options");
-
+static cl::OptionCategory BMCCategory("clang-bmc options");
+static cl::opt<int> MaxDepth("depth", cl::desc("<max_depth>"), cl::Optional,
+                             cl::init(7), cl::cat(BMCCategory));
 namespace {
 
 struct Formula {
@@ -147,8 +148,8 @@ Optional<std::string> caseStmtVal(CaseStmt *CaseSt) {
     return None;
 }
 
-void processBranch(CFGBlock *N, std::vector<std::string> &Clauses,
-                   std::unordered_map<std::string, int> &SSATable) {
+void processBranches(CFGBlock *N, std::vector<std::string> &Clauses,
+                     std::unordered_map<std::string, int> &SSATable) {
     if (N->succ_empty())
         return;
     auto *NextBlock = *std::next(&N);
@@ -190,7 +191,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
 
     ASTContext *Ctx;
     BlockPaths Paths;
-    unsigned long Depth = 7;
+    unsigned long Depth = MaxDepth;
 
     void dfsHelper(BlockPaths &PS, BlockPath &P, CFGBlock *Src) {
         if (P.size() > Depth)
@@ -242,7 +243,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                         continue;
                     processStmt(S, Clauses, SSATable);
                 }
-                processBranch(N, Clauses, SSATable);
+                processBranches(N, Clauses, SSATable);
                 Fs.push_back({Clauses, SSATable});
             }
         }
@@ -281,4 +282,3 @@ int main(int argc, const char **argv) {
                    OptionsParser.getSourcePathList());
     return Tool.run(newFrontendActionFactory<FunctionDeclAction>().get());
 }
-
