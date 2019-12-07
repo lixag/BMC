@@ -5,6 +5,7 @@
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/ADT/STLExtras.h"
 #include <unordered_map>
 #include <vector>
 
@@ -183,7 +184,6 @@ void processBranches(CFGBlock *N, std::vector<std::string> &Clauses,
 }
 
 class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
-  private:
     using BlockPaths = std::vector<std::vector<CFGBlock *>>;
     using BlockPath = std::vector<CFGBlock *>;
 
@@ -267,8 +267,7 @@ class FunctionDeclAction : public ASTFrontendAction {
   public:
     std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &Compiler,
                                                    StringRef InFile) override {
-        return std::unique_ptr<ASTConsumer>(
-            new FunctionDeclConsumer{&Compiler.getASTContext()});
+        return make_unique<FunctionDeclConsumer>(&Compiler.getASTContext());
     }
 };
 } // namespace
