@@ -19,7 +19,6 @@ static cl::OptionCategory BMCCategory("clang-bmc options");
 static cl::opt<int> MaxDepth("depth", cl::desc("<max_depth>"), cl::Optional,
                              cl::init(7), cl::cat(BMCCategory));
 namespace {
-
 struct Formula {
   std::vector<std::string> Clauses;
   std::unordered_map<std::string, int> SSATable;
@@ -34,70 +33,71 @@ struct Formula {
   }
 };
 
-void unaryOp(const Stmt *stmt, std::vector<std::string> &Clause,
+void unaryOp(StringRef FuncName, const Stmt *stmt,
+             std::vector<std::string> &Clauses,
              std::unordered_map<std::string, int> &SSATable) {
   auto *U = cast<UnaryOperator>(stmt);
-  std::string formula;
+  std::string Clause, Prefix = FuncName.str() + '_';
   auto *E = U->getSubExpr();
   auto *DRE = cast<DeclRefExpr>(E);
   auto *VD = cast<VarDecl>(DRE->getDecl());
-  std::string Var = VD->getQualifiedNameAsString();
+  std::string Var = Prefix + VD->getQualifiedNameAsString();
   auto R = std::to_string(SSATable[Var]);
-  formula.append(Var + std::to_string(++SSATable[Var]) + "==" + Var + R);
+  Clause.append(Var + std::to_string(++SSATable[Var]) + "==" + Var + R);
   if (U->isIncrementOp()) {
-    formula.append("+1");
+    Clause.append("+1");
   } else if (U->isDecrementOp()) {
-    formula.append("-1");
+    Clause.append("-1");
   }
 }
 
-void processRHSSelfIncOrDec(const Stmt *stmt, std::vector<std::string> &Clause,
+void processRHSSelfIncOrDec(StringRef FuncName, const Stmt *stmt,
+                            std::vector<std::string> &Clauses,
                             std::unordered_map<std::string, int> &SSATable,
                             bool Pre) {
   auto *B = cast<BinaryOperator>(stmt);
   auto *RHS = B->getRHS();
-  std::string formula;
+  std::string Clause, Prefix = FuncName.str() + '_';
   if (auto *UOP = dyn_cast<UnaryOperator>(RHS)) {
-    if (Pre && !UOP->isPrefix())
+    if ((Pre && !UOP->isPrefix()) || (!Pre && !UOP->isPostfix()))
       return;
-    if (!Pre && !UOP->isPostfix())
-      return;
+
     auto *E = UOP->getSubExpr();
     auto *DRE = cast<DeclRefExpr>(E);
     auto *VD = cast<VarDecl>(DRE->getDecl());
-    std::string Var = VD->getQualifiedNameAsString();
+    std::string Var = Prefix + VD->getQualifiedNameAsString();
     auto R = std::to_string(SSATable[Var]);
 
-    formula.append(Var + std::to_string(++SSATable[Var]) + "==" + Var + R);
+    Clause.append(Var + std::to_string(++SSATable[Var]) + "==" + Var + R);
     if (UOP->isIncrementOp()) {
-      formula.append("+1");
+      Clause.append("+1");
     } else if (UOP->isDecrementOp()) {
-      formula.append("-1");
+      Clause.append("-1");
     }
-    Clause.push_back(formula);
+    Clauses.push_back(Clause);
   }
 }
 
-std::string binaryOp(const Stmt *stmt,
+std::string binaryOp(StringRef FuncName, const Stmt *stmt,
                      std::unordered_map<std::string, int> &SSATable) {
   auto *B = cast<BinaryOperator>(stmt);
   auto *RHS = B->getRHS();
-  std::string R;
+  std::string R, Prefix = FuncName.str() + '_';
   if (auto *Implicit = dyn_cast<ImplicitCastExpr>(RHS))
     RHS = Implicit->getSubExpr();
   if (auto *BOP = dyn_cast<BinaryOperator>(RHS)) {
-    R = binaryOp(BOP, SSATable);
+    R = binaryOp(FuncName, BOP, SSATable);
   } else if (auto *UOP = dyn_cast<UnaryOperator>(RHS)) {
     auto *E = UOP->getSubExpr();
     auto *DRE = cast<DeclRefExpr>(E);
     auto *VD = cast<VarDecl>(DRE->getDecl());
-    std::string Var = VD->getQualifiedNameAsString();
+    std::string Var = Prefix + VD->getQualifiedNameAsString();
     R = Var + std::to_string(SSATable[Var]);
   } else if (auto *IntLit = dyn_cast<IntegerLiteral>(RHS)) {
     R = IntLit->getValue().toString(10, false);
   } else if (auto *DRE = dyn_cast<DeclRefExpr>(RHS)) {
     if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
-      std::string Var = VD->getQualifiedNameAsString();
+      std::string Var = Prefix + VD->getQualifiedNameAsString();
       R = Var + std::to_string(SSATable[Var]);
     }
   }
@@ -107,10 +107,10 @@ std::string binaryOp(const Stmt *stmt,
   if (auto *Implicit = dyn_cast<ImplicitCastExpr>(LHS))
     LHS = Implicit->getSubExpr();
   if (auto *BOP = dyn_cast<BinaryOperator>(LHS)) {
-    Var = binaryOp(BOP, SSATable);
+    Var = binaryOp(FuncName, BOP, SSATable);
   } else if (auto *DRE = dyn_cast<DeclRefExpr>(LHS)) {
     if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
-      Var = VD->getQualifiedNameAsString();
+      Var = Prefix + VD->getQualifiedNameAsString();
   }
   L = B->isAssignmentOp()
           ? Var + std::to_string(++SSATable[Var]) + "=="
@@ -118,43 +118,46 @@ std::string binaryOp(const Stmt *stmt,
   return L + R;
 }
 
-void declStmt(const Stmt *stmt, std::vector<std::string> &Clause,
+void declStmt(StringRef FuncName, const Stmt *stmt,
+              std::vector<std::string> &Clauses,
               std::unordered_map<std::string, int> &SSATable) {
   auto *DST = cast<DeclStmt>(stmt);
   auto DS = DST->decls();
+  std::string Prefix = FuncName.str() + '_';
   for (const auto D : DS) {
-    std::string formula;
+    std::string Clause;
     if (auto *VDC = dyn_cast<VarDecl>(D)) {
-      auto Var = VDC->getQualifiedNameAsString();
+      auto Var = Prefix + VDC->getQualifiedNameAsString();
       auto *Init = VDC->getInit();
       if (Init) {
-        formula.append(Var + std::to_string(SSATable[Var]));
+        Clause.append(Var + std::to_string(SSATable[Var]));
         if (auto *IntLit = dyn_cast<IntegerLiteral>(Init))
-          formula.append(IntLit->getValue().toString(10, false));
+          Clause.append(IntLit->getValue().toString(10, false));
       } else {
         SSATable[Var];
       }
     }
     // only var decl
-    if (!formula.empty())
-      Clause.push_back(formula);
+    if (!Clause.empty())
+      Clauses.push_back(Clause);
   }
 }
 
 // generating ssa form formula here
-void processStmt(const Stmt *stmt, std::vector<std::string> &Clause,
+void processStmt(StringRef FuncName, const Stmt *stmt,
+                 std::vector<std::string> &Clause,
                  std::unordered_map<std::string, int> &SSATable) {
   switch (stmt->getStmtClass()) {
   case Stmt::BinaryOperatorClass:
-    processRHSSelfIncOrDec(stmt, Clause, SSATable, true);
-    Clause.push_back(binaryOp(stmt, SSATable));
-    processRHSSelfIncOrDec(stmt, Clause, SSATable, false);
+    processRHSSelfIncOrDec(FuncName, stmt, Clause, SSATable, true);
+    Clause.push_back(binaryOp(FuncName, stmt, SSATable));
+    processRHSSelfIncOrDec(FuncName, stmt, Clause, SSATable, false);
     break;
   case Stmt::DeclStmtClass:
-    declStmt(stmt, Clause, SSATable);
+    declStmt(FuncName, stmt, Clause, SSATable);
     break;
   case Stmt::UnaryOperatorClass:
-    unaryOp(stmt, Clause, SSATable);
+    unaryOp(FuncName, stmt, Clause, SSATable);
     break;
   }
 }
@@ -198,21 +201,6 @@ void generateAndRunZ3Code(std::vector<Formula> &Fs) {
                                  break;
                      })";
     OS << "\n}\n";
-    //    std::system(
-    //        ("g++ " + FileName + ".cc" + " -o " + FileName +
-    //        "-lz3").data());
-    //
-    //    std::system(("./" + FileName + " > " + FileName + ".txt").data());
-    //    std::ifstream f(FileName + ".txt");
-    //    std::string buf;
-    //    std::getline(f, buf);
-    //    if (buf == "this path is not valid") {
-    //      F.print();
-    //      errs() << "formula not valid";
-    //    } else if (buf == "unknown") {
-    //      F.print();
-    //      errs() << "unknown";
-    //    }
     ++FileNum;
   }
 }
@@ -256,39 +244,50 @@ void processBranches(CFGBlock *&N, std::vector<std::string> &Clauses,
           if (auto Val = caseStmtVal(CaseSt))
             Clauses.push_back('(' + Last + ")!=" + Val.getValue());
       }
-    } else {
-      if (auto *CaseSt = dyn_cast<CaseStmt>(LB)) {
-        if (auto Val = caseStmtVal(CaseSt))
-          Clauses.push_back('(' + Last + ")==" + Val.getValue());
-      }
+    } else if (auto *CaseSt = dyn_cast<CaseStmt>(LB)) {
+      if (auto Val = caseStmtVal(CaseSt))
+        Clauses.push_back('(' + Last + ")==" + Val.getValue());
     }
   }
 }
+using BlockPaths = std::vector<std::vector<std::pair<StringRef, CFGBlock *>>>;
+using BlockPath = std::vector<std::pair<StringRef, CFGBlock *>>;
+// inlining func and identify paths that terminate with an Error label with
+// Depth steps
 
 class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
-  using BlockPaths = std::vector<std::vector<CFGBlock *>>;
-  using BlockPath = std::vector<CFGBlock *>;
-
   ASTContext *Ctx;
-  BlockPaths Paths;
-  unsigned long Depth = 7;
-
-  void dfsHelper(BlockPaths &PS, BlockPath &P, CFGBlock *Src) {
-    if (P.size() > Depth)
+  void dfsHelper(StringRef FuncName, BlockPaths &PS, BlockPath &P,
+                 CFGBlock *Src, const unsigned long Depth, unsigned long Step) {
+    if (Step > Depth)
       return;
     if (!P.empty()) {
-      if (auto *Label = P.back()->getLabel()) {
+      if (auto *Label = P.back().second->getLabel()) {
         if (auto *L = dyn_cast<LabelStmt>(Label)) {
           if (strcmp(L->getName(), "Error") == 0) {
             PS.push_back(P);
             return;
           }
         }
+      } else {
+        // if call expr, get func decl, build cfg, then call dfs
+        for (auto &E : *P.back().second) {
+          if (auto *Call = dyn_cast<CallExpr>(&E)) {
+            auto *Callee = Call->getDirectCallee();
+            if (!Callee)
+              return;
+            auto FuncCFG = CFG::buildCFG(Callee, Callee->getBody(), Ctx,
+                                         CFG::BuildOptions());
+            dfsHelper(Callee->getNameInfo().getAsString(), PS, P,
+                      &FuncCFG->getEntry(), Depth, 0);
+          }
+        }
       }
     }
-    P.push_back(Src);
+    P.push_back({FuncName, Src});
     for (auto &E : Src->succs())
-      dfsHelper(PS, P, E.getReachableBlock());
+      dfsHelper(FuncName, PS, P, E.getReachableBlock(), Depth,
+                Step + Src->size());
     P.pop_back();
   }
 
@@ -296,36 +295,36 @@ public:
   explicit FunctionDeclVisitor(ASTContext *ctx) : Ctx{ctx} {}
 
   bool VisitFunctionDecl(FunctionDecl *Decl) {
-    // only care about functions that are not in the header files
-    if (!Ctx->getSourceManager().isWrittenInMainFile(Decl->getBeginLoc()))
+    if (!Ctx->getSourceManager().isWrittenInMainFile(Decl->getBeginLoc()) ||
+        !Ctx->getFullLoc(Decl->getBeginLoc()).isValid() || !Decl->hasBody() ||
+        Decl->getNameInfo().getAsString() != "main")
       return true;
-    if (!Ctx->getFullLoc(Decl->getBeginLoc()).isValid() || !Decl->hasBody())
-      return true;
-
     std::vector<Formula> Fs;
     auto FuncCFG =
         CFG::buildCFG(Decl, Decl->getBody(), Ctx, CFG::BuildOptions());
-    // FuncCFG->dump(LangOptions(), false);
-    // FuncCFG->viewCFG(LangOptions());
+    FuncCFG->dump(LangOptions(), false);
+    FuncCFG->viewCFG(LangOptions());
 
+    BlockPaths Paths;
+    unsigned long Depth = MaxDepth;
     BlockPath Path;
-    dfsHelper(Paths, Path, &FuncCFG->getEntry());
+    dfsHelper("main", Paths, Path, &FuncCFG->getEntry(), Depth, 0);
 
     for (auto &P : Paths) {
       std::vector<std::string> Clauses;
       std::unordered_map<std::string, int> SSATable;
       for (auto &N : P) {
-        for (auto &E : *N) {
+        for (auto &E : *N.second) {
           auto *S = E.castAs<CFGStmt>().getStmt();
           if (S->getStmtClass() != Stmt::BinaryOperatorClass &&
               S->getStmtClass() != Stmt::UnaryOperatorClass &&
               S->getStmtClass() != Stmt::DeclStmtClass)
             continue;
-          processStmt(S, Clauses, SSATable);
+          processStmt(N.first, S, Clauses, SSATable);
         }
         if (N == P.back())
           continue;
-        processBranches(N, Clauses, SSATable);
+        processBranches(N.second, Clauses, SSATable);
       }
       Fs.push_back(Formula{Clauses, SSATable});
     }
@@ -337,18 +336,12 @@ public:
 class FunctionDeclConsumer : public ASTConsumer {
   FunctionDeclVisitor Visitor;
 
-  //
-  
-
 public:
   explicit FunctionDeclConsumer(ASTContext *Ctx) : Visitor{Ctx} {}
 
   bool HandleTopLevelDecl(DeclGroupRef DG) override {
     for (auto D : DG)
       Visitor.TraverseDecl(D);
-    
-
-
 
     return true;
   }
@@ -363,6 +356,7 @@ public:
   }
 };
 } // namespace
+// namespace
 
 int main(int argc, const char **argv) {
   CommonOptionsParser OptionsParser(argc, argv, BMCCategory);
