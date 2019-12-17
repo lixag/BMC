@@ -25,31 +25,30 @@ struct Formula {
   std::unordered_map<std::string, int> SSATable;
   std::vector<unsigned int> LineNum;
   void print() {
-    errs() << "path: size " << Clauses.size() << ' ';
+    errs() << "z3 formula: ";
     for (auto &Elem : Clauses)
-      errs() << Elem << ' ';
-    errs() << "\nSSATable: ";
-    for (auto &Elem : SSATable)
-      errs() << Elem.first << ' ' << Elem.second << ' ';
+      errs().changeColor(raw_ostream::YELLOW, true) << Elem << ' ';
     errs() << '\n';
+    errs().resetColor() << "path size " << Clauses.size() << '\n';
   }
 };
 
-void unaryOp(const Stmt *stmt, std::vector<std::string> &Clause,
+void unaryOp(const Stmt *stmt, std::vector<std::string> &Clauses,
              std::unordered_map<std::string, int> &SSATable) {
   auto *U = cast<UnaryOperator>(stmt);
-  std::string formula;
+  std::string Clause;
   auto *E = U->getSubExpr();
   auto *DRE = cast<DeclRefExpr>(E);
   auto *VD = cast<VarDecl>(DRE->getDecl());
   std::string Var = VD->getQualifiedNameAsString();
   auto R = std::to_string(SSATable[Var]);
-  formula.append(Var + std::to_string(++SSATable[Var]) + "==" + Var + R);
+  Clause.append(Var + std::to_string(++SSATable[Var]) + "==" + Var + R);
   if (U->isIncrementOp()) {
-    formula.append("+1");
+    Clause.append("+1");
   } else if (U->isDecrementOp()) {
-    formula.append("-1");
+    Clause.append("-1");
   }
+  Clauses.push_back(Clause);
 }
 
 void processRHSSelfIncOrDec(const Stmt *stmt, std::vector<std::string> &Clause,
@@ -157,6 +156,8 @@ void processStmt(const Stmt *stmt, std::vector<std::string> &Clause,
   case Stmt::UnaryOperatorClass:
     unaryOp(stmt, Clause, SSATable);
     break;
+  default:
+    break;
   }
 }
 
@@ -197,9 +198,10 @@ void generateAndRunZ3Code(std::vector<Formula> &Fs) {
     OS << "    s.check();\n";
     OS << R"(    switch (s.check()) {
                              case unsat:
+                                 std::cout <<"this path is valid\n";
                                  break;
                              case sat:
-                                 std::cout <<"this path is not valid\n";
+                                 std::cout << "\033[1;31mthis path is not valid\033[0m\n";
                                  std::cout <<"line numbers are: "<< LineNums << '\n';
                                  break;
                              case unknown:
@@ -207,12 +209,15 @@ void generateAndRunZ3Code(std::vector<Formula> &Fs) {
                                  std::cout <<"line numbers are: "<< LineNums << '\n';
                                  break;
                      })";
-    OS << "\n}\n";
+    OS << '\n';
+    OS << R"(    std::cout << std::string(90, '-') << '\n';
+             })";
+
     OS.flush();
 
-    std::system(("g++ " + FileName + " -o z3 -lz3").data());
-    std::system("./z3");
-    std::system("rm z3 ");
+    auto _ = std::system(("g++ " + FileName + " -o z3 -lz3").data());
+    _ = std::system("./z3");
+    _ = std::system(("rm z3 " + FileName).data());
 
     ++FileNum;
   }
@@ -276,9 +281,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
   BlockPaths Paths;
   unsigned long Depth = MaxDepth;
 
-  void dfsHelper(BlockPaths &PS, BlockPath &P, CFGBlock *Src) {
-    if (P.size() > Depth)
-      return;
+  void dfsHelper(BlockPaths &PS, BlockPath &P, CFGBlock *Src, unsigned Size) {
     if (!P.empty()) {
       if (auto *Label = P.back()->getLabel()) {
         if (auto *L = dyn_cast<LabelStmt>(Label)) {
@@ -289,9 +292,11 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
         }
       }
     }
+    if (Size > Depth)
+      return;
     P.push_back(Src);
     for (auto &E : Src->succs())
-      dfsHelper(PS, P, E.getReachableBlock());
+      dfsHelper(PS, P, E.getReachableBlock(), Size + Src->size());
     P.pop_back();
   }
 
@@ -312,7 +317,7 @@ public:
     // FuncCFG->viewCFG(LangOptions());
 
     BlockPath Path;
-    dfsHelper(Paths, Path, &FuncCFG->getEntry());
+    dfsHelper(Paths, Path, &FuncCFG->getEntry(), 0);
 
     for (auto &P : Paths) {
       std::vector<std::string> Clauses;
