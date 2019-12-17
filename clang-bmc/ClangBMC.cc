@@ -350,8 +350,6 @@ public:
 class FunctionDeclConsumer : public ASTConsumer {
   FunctionDeclVisitor Visitor;
 
-  //
-
 public:
   explicit FunctionDeclConsumer(ASTContext *Ctx) : Visitor{Ctx} {}
 
