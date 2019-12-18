@@ -16,8 +16,9 @@ using namespace clang::driver;
 using namespace clang::tooling;
 
 static cl::OptionCategory BMCCategory("clang-bmc options");
-static cl::opt<int> MaxDepth("depth", cl::desc("<max_depth>"), cl::Optional,
-                             cl::init(7), cl::cat(BMCCategory));
+static cl::opt<unsigned long> MaxDepth("depth", cl::desc("<max_depth>"),
+                                       cl::Optional, cl::init(7ul),
+                                       cl::cat(BMCCategory));
 namespace {
 
 struct Formula {
@@ -26,8 +27,18 @@ struct Formula {
   std::vector<unsigned int> LineNum;
   void print() {
     errs() << "z3 formula: ";
-    for (auto &Elem : Clauses)
-      errs().changeColor(raw_ostream::YELLOW, true) << Elem << ' ';
+
+    unsigned long Len = 0;
+    for (auto &Elem : Clauses) {
+      if (Len + Elem.size() + 1 < 90)
+        errs().changeColor(raw_ostream::YELLOW, true) << Elem << ' ';
+      else {
+        errs().changeColor(raw_ostream::YELLOW, true) << '\n' << Elem << ' ';
+        Len = 0;
+      }
+      Len += Elem.size() + 1;
+    }
+
     errs() << '\n';
     errs().resetColor() << "path size " << Clauses.size() << '\n';
   }
@@ -161,9 +172,68 @@ void processStmt(const Stmt *stmt, std::vector<std::string> &Clause,
   }
 }
 
+Optional<std::string> caseStmtVal(CaseStmt *CaseSt) {
+  if (!CaseSt->getLHS())
+    return None;
+  auto *ConstSt = cast<ConstantExpr>(CaseSt->getLHS());
+  auto *CaseVal = ConstSt->getSubExpr();
+  if (auto *IntLit = dyn_cast<IntegerLiteral>(CaseVal))
+    return IntLit->getValue().toString(10, false);
+  return None;
+}
+
+// tricky pass ptr by ref
+void processBranches(CFGBlock *&N, std::vector<std::string> &Clauses,
+                     std::unordered_map<std::string, int> &SSATable,
+                     std::vector<unsigned> &LineNums, ASTContext *Ctx) {
+  if (N->succ_empty())
+    return;
+  auto *NextBlock = *std::next(&N);
+  auto ID = NextBlock->getBlockID();
+  auto T = N->getTerminator();
+  auto *St = T.getStmt();
+  if (!St)
+    return;
+  if (St->getStmtClass() == Stmt::GotoStmtClass) {
+    auto FullLocation = Ctx->getFullLoc(St->getBeginLoc());
+    if (FullLocation.isValid())
+      LineNums.push_back(FullLocation.getSpellingLineNumber());
+  }
+
+  if (isa<ForStmt>(St) || isa<IfStmt>(St) || isa<BinaryOperator>(St) ||
+      isa<WhileStmt>(St)) {
+    // rewrite the last the stmt in N
+    if ((*N->succ_begin())->getBlockID() != ID) {
+      Clauses.back() = "!(" + Clauses.back() + ")";
+    }
+  } else if (auto *SwitchSt = dyn_cast<SwitchStmt>(St)) {
+    auto *LB = NextBlock->getLabel();
+    if (!LB)
+      return;
+    const auto Last = Clauses.back();
+    Clauses.pop_back();
+    if (isa<DefaultStmt>(LB)) {
+      // combine all other cases
+      for (auto *FirstCase = SwitchSt->getSwitchCaseList(); FirstCase;
+           FirstCase = FirstCase->getNextSwitchCase()) {
+        if (auto *CaseSt = dyn_cast<CaseStmt>(FirstCase))
+          if (auto Val = caseStmtVal(CaseSt))
+            Clauses.push_back('(' + Last + ")!=" + Val.getValue());
+      }
+    } else {
+      if (auto *CaseSt = dyn_cast<CaseStmt>(LB)) {
+        if (auto Val = caseStmtVal(CaseSt))
+          Clauses.push_back('(' + Last + ")==" + Val.getValue());
+      }
+    }
+  }
+}
+
 void generateAndRunZ3Code(std::vector<Formula> &Fs) {
   int FileNum = 0;
   for (auto &F : Fs) {
+    if (F.Clauses.size() > MaxDepth)
+      return;
     F.print();
     std::error_code EC;
     std::string FileName = "Z3_code" + std::to_string(FileNum) + ".cc";
@@ -210,7 +280,7 @@ void generateAndRunZ3Code(std::vector<Formula> &Fs) {
                                  break;
                      })";
     OS << '\n';
-    OS << R"(    std::cout << std::string(90, '-') << '\n';
+    OS << R"(    std::cout << std::string(100, '-') << '\n';
              })";
 
     OS.flush();
@@ -223,56 +293,6 @@ void generateAndRunZ3Code(std::vector<Formula> &Fs) {
   }
 }
 
-Optional<std::string> caseStmtVal(CaseStmt *CaseSt) {
-  if (!CaseSt->getLHS())
-    return None;
-  auto *ConstSt = cast<ConstantExpr>(CaseSt->getLHS());
-  auto *CaseVal = ConstSt->getSubExpr();
-  if (auto *IntLit = dyn_cast<IntegerLiteral>(CaseVal))
-    return IntLit->getValue().toString(10, false);
-  return None;
-}
-
-// tricky pass ptr by ref
-void processBranches(CFGBlock *&N, std::vector<std::string> &Clauses,
-                     std::unordered_map<std::string, int> &SSATable) {
-  if (N->succ_empty())
-    return;
-  auto *NextBlock = *std::next(&N);
-  auto ID = NextBlock->getBlockID();
-  auto T = N->getTerminator();
-  auto *St = T.getStmt();
-  if (!St)
-    return;
-
-  if (isa<ForStmt>(St) || isa<IfStmt>(St) || isa<BinaryOperator>(St)) {
-    // rewrite the last the stmt in N
-    if ((*N->succ_begin())->getBlockID() != ID) {
-      Clauses.back() = "!(" + Clauses.back() + ")";
-    }
-  } else if (auto *SwitchSt = dyn_cast<SwitchStmt>(St)) {
-    auto *LB = NextBlock->getLabel();
-    if (!LB)
-      return;
-    const auto Last = Clauses.back();
-    Clauses.pop_back();
-    if (isa<DefaultStmt>(LB)) {
-      // combine all other cases
-      for (auto *FirstCase = SwitchSt->getSwitchCaseList(); FirstCase;
-           FirstCase = FirstCase->getNextSwitchCase()) {
-        if (auto *CaseSt = dyn_cast<CaseStmt>(FirstCase))
-          if (auto Val = caseStmtVal(CaseSt))
-            Clauses.push_back('(' + Last + ")!=" + Val.getValue());
-      }
-    } else {
-      if (auto *CaseSt = dyn_cast<CaseStmt>(LB)) {
-        if (auto Val = caseStmtVal(CaseSt))
-          Clauses.push_back('(' + Last + ")==" + Val.getValue());
-      }
-    }
-  }
-}
-
 class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
   using BlockPaths = std::vector<std::vector<CFGBlock *>>;
   using BlockPath = std::vector<CFGBlock *>;
@@ -281,22 +301,21 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
   BlockPaths Paths;
   unsigned long Depth = MaxDepth;
 
-  void dfsHelper(BlockPaths &PS, BlockPath &P, CFGBlock *Src, unsigned Size) {
-    if (!P.empty()) {
-      if (auto *Label = P.back()->getLabel()) {
-        if (auto *L = dyn_cast<LabelStmt>(Label)) {
-          if (strcmp(L->getName(), "Error") == 0) {
-            PS.push_back(P);
-            return;
-          }
-        }
-      }
-    }
+  void dfs(BlockPaths &PS, BlockPath &P, CFGBlock *Src, unsigned Size) {
     if (Size > Depth)
       return;
     P.push_back(Src);
+    if (auto *Label = P.back()->getLabel()) {
+      if (auto *L = dyn_cast<LabelStmt>(Label)) {
+        if (strcmp(L->getName(), "Error") == 0) {
+          PS.push_back(P);
+          P.pop_back();
+          return;
+        }
+      }
+    }
     for (auto &E : Src->succs())
-      dfsHelper(PS, P, E.getReachableBlock(), Size + Src->size());
+      dfs(PS, P, E.getReachableBlock(), Size + Src->size());
     P.pop_back();
   }
 
@@ -317,19 +336,18 @@ public:
     // FuncCFG->viewCFG(LangOptions());
 
     BlockPath Path;
-    dfsHelper(Paths, Path, &FuncCFG->getEntry(), 0);
+    dfs(Paths, Path, &FuncCFG->getEntry(), 0);
 
     for (auto &P : Paths) {
       std::vector<std::string> Clauses;
       std::unordered_map<std::string, int> SSATable;
-      std::vector<unsigned int> LineNums;
+      std::vector<unsigned> LineNums;
       for (auto &N : P) {
         for (auto &E : *N) {
           auto *S = E.castAs<CFGStmt>().getStmt();
           if (S->getStmtClass() != Stmt::BinaryOperatorClass &&
               S->getStmtClass() != Stmt::UnaryOperatorClass &&
-              S->getStmtClass() != Stmt::DeclStmtClass &&
-              S->getStmtClass() != Stmt::GotoStmtClass)
+              S->getStmtClass() != Stmt::DeclStmtClass)
             continue;
           auto FullLocation = Ctx->getFullLoc(S->getBeginLoc());
           if (FullLocation.isValid())
@@ -338,7 +356,8 @@ public:
         }
         if (N == P.back())
           continue;
-        processBranches(N, Clauses, SSATable);
+
+        processBranches(N, Clauses, SSATable, LineNums, Ctx);
       }
       Fs.push_back(Formula{Clauses, SSATable, LineNums});
     }
